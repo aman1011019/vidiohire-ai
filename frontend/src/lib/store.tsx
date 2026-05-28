@@ -1,5 +1,5 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
-import { supabase } from "@/integrations/supabase/client";
+import axios from "axios";
 
 export type Role = "candidate" | "recruiter";
 export type User = {
@@ -38,11 +38,48 @@ type Ctx = LocalState & {
 
 const AppContext = createContext<Ctx | null>(null);
 const KEY = "vidiohire:local";
+const TOKEN_KEY = "vidiohire:token";
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+// Configure axios instance
+const apiClient = axios.create({
+  baseURL: API_URL,
+  headers: {
+    "Content-Type": "application/json",
+  },
+});
+
+// Add token to requests if available
+apiClient.interceptors.request.use((config) => {
+  const token = localStorage.getItem(TOKEN_KEY);
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
 
 const seedNotifications: Notification[] = [
-  { id: "n1", title: "Recruiter viewed your profile", body: "Alex from Stripe just viewed your video resume.", time: "2m ago", read: false },
-  { id: "n2", title: "AI Interview ready", body: "Your tailored interview for Senior FE Engineer is ready.", time: "1h ago", read: false },
-  { id: "n3", title: "New match", body: "94% match — Frontend Engineer at Linear.", time: "3h ago", read: true },
+  {
+    id: "n1",
+    title: "Recruiter viewed your profile",
+    body: "Alex from Stripe just viewed your video resume.",
+    time: "2m ago",
+    read: false,
+  },
+  {
+    id: "n2",
+    title: "AI Interview ready",
+    body: "Your tailored interview for Senior FE Engineer is ready.",
+    time: "1h ago",
+    read: false,
+  },
+  {
+    id: "n3",
+    title: "New match",
+    body: "94% match — Frontend Engineer at Linear.",
+    time: "3h ago",
+    read: true,
+  },
 ];
 
 const defaultLocal: LocalState = {
@@ -66,22 +103,24 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [authLoading, setAuthLoading] = useState(true);
 
   useEffect(() => {
-    try { localStorage.setItem(KEY, JSON.stringify(local)); } catch {}
+    try {
+      localStorage.setItem(KEY, JSON.stringify(local));
+    } catch {}
   }, [local]);
 
   useEffect(() => {
     const root = document.documentElement;
-    if (local.theme === "light") root.classList.add("light"); else root.classList.remove("light");
+    if (local.theme === "light") root.classList.add("light");
+    else root.classList.remove("light");
   }, [local.theme]);
 
-  // Hydrate profile for the current session
-  const loadProfile = async (userId: string, fallbackEmail: string) => {
-    const { data } = await supabase
-      .from("profiles")
-      .select("id,name,email,role,headline,avatar_url")
-      .eq("id", userId)
-      .maybeSingle();
-    if (data) {
+  // Load user from token on mount
+  const loadUserFromToken = async (token: string) => {
+    try {
+      const response = await apiClient.get("/auth/me", {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = response.data;
       setUser({
         id: data.id,
         name: data.name,
@@ -90,26 +129,23 @@ export function AppProvider({ children }: { children: ReactNode }) {
         headline: data.headline ?? undefined,
         avatar: data.avatar_url ?? undefined,
       });
-    } else {
-      setUser({ id: userId, name: fallbackEmail.split("@")[0], email: fallbackEmail, role: "candidate" });
+    } catch (error) {
+      console.error("Failed to load user:", error);
+      localStorage.removeItem(TOKEN_KEY);
+      setUser(null);
+    } finally {
+      setAuthLoading(false);
     }
   };
 
   useEffect(() => {
-    // Set up listener FIRST
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_evt, session) => {
-      if (session?.user) {
-        setTimeout(() => { loadProfile(session.user.id, session.user.email ?? ""); }, 0);
-      } else {
-        setUser(null);
-      }
-    });
-    // THEN get existing session
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (session?.user) loadProfile(session.user.id, session.user.email ?? "").finally(() => setAuthLoading(false));
-      else setAuthLoading(false);
-    });
-    return () => subscription.unsubscribe();
+    // Check for existing token on mount
+    const token = localStorage.getItem(TOKEN_KEY);
+    if (token) {
+      loadUserFromToken(token);
+    } else {
+      setAuthLoading(false);
+    }
   }, []);
 
   const ctx: Ctx = {
@@ -117,48 +153,103 @@ export function AppProvider({ children }: { children: ReactNode }) {
     user,
     authLoading,
     login: async (email, password) => {
-      const { data, error } = await supabase.auth.signInWithPassword({ email, password });
-      if (error) throw error;
-      const { data: profile } = await supabase
-        .from("profiles").select("id,name,email,role,headline,avatar_url")
-        .eq("id", data.user!.id).maybeSingle();
-      const u: User = profile
-        ? { id: profile.id, name: profile.name, email: profile.email, role: profile.role as Role, headline: profile.headline ?? undefined, avatar: profile.avatar_url ?? undefined }
-        : { id: data.user!.id, name: email.split("@")[0], email, role: "candidate" };
-      setUser(u);
-      return u;
+      try {
+        const response = await apiClient.post("/auth/login", { email, password });
+        const { token, user: userData } = response.data;
+
+        // Store token
+        localStorage.setItem(TOKEN_KEY, token);
+
+        const u: User = {
+          id: userData.id,
+          name: userData.name,
+          email: userData.email,
+          role: userData.role as Role,
+          headline: userData.headline ?? undefined,
+          avatar: userData.avatar_url ?? undefined,
+        };
+        setUser(u);
+        return u;
+      } catch (error: any) {
+        throw new Error(error.response?.data?.detail || "Login failed");
+      }
     },
     signup: async (name, email, password, role) => {
-      const redirectUrl = `${window.location.origin}/dashboard`;
-      const { data, error } = await supabase.auth.signUp({
-        email,
-        password,
-        options: { emailRedirectTo: redirectUrl, data: { name, role } },
-      });
-      if (error) throw error;
-      const u: User = { id: data.user?.id ?? "", name, email, role };
-      if (data.session) setUser(u);
-      return u;
+      try {
+        const response = await apiClient.post("/auth/signup", {
+          name,
+          email,
+          password,
+          role,
+        });
+        const { token, user: userData } = response.data;
+
+        // Store token
+        localStorage.setItem(TOKEN_KEY, token);
+
+        const u: User = {
+          id: userData.id,
+          name: userData.name,
+          email: userData.email,
+          role: userData.role as Role,
+          headline: userData.headline ?? undefined,
+          avatar: userData.avatar_url ?? undefined,
+        };
+        setUser(u);
+        return u;
+      } catch (error: any) {
+        throw new Error(error.response?.data?.detail || "Signup failed");
+      }
     },
     logout: async () => {
-      await supabase.auth.signOut();
-      setUser(null);
+      try {
+        await apiClient.post("/auth/logout");
+      } catch (error) {
+        console.error("Logout error:", error);
+      } finally {
+        localStorage.removeItem(TOKEN_KEY);
+        setUser(null);
+      }
     },
     toggleSavedJob: (id) =>
-      setLocal((s) => ({ ...s, savedJobs: s.savedJobs.includes(id) ? s.savedJobs.filter((x) => x !== id) : [...s.savedJobs, id] })),
+      setLocal((s) => ({
+        ...s,
+        savedJobs: s.savedJobs.includes(id)
+          ? s.savedJobs.filter((x) => x !== id)
+          : [...s.savedJobs, id],
+      })),
     apply: (jobId) =>
       setLocal((s) =>
         s.applications.some((a) => a.jobId === jobId)
           ? s
-          : { ...s, applications: [...s.applications, { id: "a_" + Date.now(), jobId, status: "Applied", appliedAt: new Date().toISOString() }] }
+          : {
+              ...s,
+              applications: [
+                ...s.applications,
+                {
+                  id: "a_" + Date.now(),
+                  jobId,
+                  status: "Applied",
+                  appliedAt: new Date().toISOString(),
+                },
+              ],
+            },
       ),
-    withdraw: (jobId) => setLocal((s) => ({ ...s, applications: s.applications.filter((a) => a.jobId !== jobId) })),
+    withdraw: (jobId) =>
+      setLocal((s) => ({ ...s, applications: s.applications.filter((a) => a.jobId !== jobId) })),
     setVideoResume: (v) => setLocal((s) => ({ ...s, videoResume: v })),
-    markAllRead: () => setLocal((s) => ({ ...s, notifications: s.notifications.map((n) => ({ ...n, read: true })) })),
+    markAllRead: () =>
+      setLocal((s) => ({
+        ...s,
+        notifications: s.notifications.map((n) => ({ ...n, read: true })),
+      })),
     addNotification: (n) =>
       setLocal((s) => ({
         ...s,
-        notifications: [{ id: "n_" + Date.now(), read: false, time: "just now", ...n }, ...s.notifications],
+        notifications: [
+          { id: "n_" + Date.now(), read: false, time: "just now", ...n },
+          ...s.notifications,
+        ],
       })),
     setTheme: (t) => setLocal((s) => ({ ...s, theme: t })),
   };
